@@ -1,22 +1,17 @@
-// use aws_config;
-// use aws_sdk_s3::presigning::config::PresigningConfig;
-// use aws_sdk_s3::Client as S3Client;
-// use aws_sdk_s3::{self, types::ByteStream};
-// use chrono;
-// use chrono::Datelike;
-// use chrono::Timelike;
+use aws_config;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::{self, types::ByteStream};
+use chrono::Datelike;
+use chrono::Timelike;
 use clap::Parser;
-// use postgres::Row;
 use postgres::{Client, Config, NoTls};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-// use sha2::Digest;
 use std::error::Error;
-// use std::hash::{Hash, Hasher};
 use std::ops::Div;
 use std::str;
 use std::sync::mpsc::{self, Receiver, Sender};
-// use std::thread;
-// use std::time::Duration;
+use tokio;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Bounds {
@@ -48,6 +43,8 @@ struct Args {
     pg_schema: String,
     pg_table: String,
     pg_keys: Vec<String>,
+    #[arg(short, long)]
+    aws_prefix: Option<String>,
     #[arg(short, long, default_value_t = 0)]
     start: i32,
     #[arg(short = 'm', long)]
@@ -66,7 +63,10 @@ struct Args {
     null: String,
 }
 
-fn get_pg_batch(args: Args, _tx: Sender<String>) -> Result<(), Box<dyn Error>> {
+fn get_pg_batch(
+    args: Args,
+    tx: Sender<Vec<postgres::SimpleQueryMessage>>,
+) -> Result<(), Box<dyn Error>> {
     let mut pg_client: Client = Config::new()
         .user(&args.pg_user)
         .password(&args.pg_password)
@@ -125,6 +125,18 @@ fn get_pg_batch(args: Args, _tx: Sender<String>) -> Result<(), Box<dyn Error>> {
         panic!("No key metadata retreived");
     }
 
+    let order_by: String = key_metadata
+        .iter()
+        .map(|it| it.name.clone())
+        .collect::<Vec<String>>()
+        .join(", ");
+
+    let columns: String = column_metadata
+        .iter()
+        .map(|it| it.formatted_name.clone())
+        .collect::<Vec<String>>()
+        .join(", ");
+
     let is_numeric: bool = [
         "smallint",
         "integer",
@@ -177,18 +189,6 @@ fn get_pg_batch(args: Args, _tx: Sender<String>) -> Result<(), Box<dyn Error>> {
 
     let iterations: i32 = bounds.get_iterations(&args.batch_size);
 
-    let order_by: String = key_metadata
-        .iter()
-        .map(|it| it.name.clone())
-        .collect::<Vec<String>>()
-        .join(", ");
-
-    let columns: String = column_metadata
-        .iter()
-        .map(|it| it.formatted_name.clone())
-        .collect::<Vec<String>>()
-        .join(", ");
-
     for i in args.start..iterations {
         let predicate: String = is_numeric
             .then_some(format!(
@@ -209,86 +209,131 @@ fn get_pg_batch(args: Args, _tx: Sender<String>) -> Result<(), Box<dyn Error>> {
             })
             .expect("Something went wrong processing the predicate");
 
-        let batch_statement = format!(
+        let batch_statement: String = format!(
             "SELECT {} FROM {}.{} WHERE {} ORDER BY {} LIMIT {}",
             &columns, &args.pg_schema, &args.pg_table, &predicate, &order_by, &args.batch_size
         );
 
-        let rows: Vec<Vec<String>> = pg_client
-            .simple_query(batch_statement.as_str())?
-            .into_iter()
-            .filter_map(|message| match message {
-                postgres::SimpleQueryMessage::Row(row) => Some(get_simple_data(row)),
-                _ => None,
-            })
-            .collect();
-
-        // Send rows as ByteStream by sender
+        let rows: Vec<postgres::SimpleQueryMessage> =
+            pg_client.simple_query(batch_statement.as_str())?;
 
         for i in 0..key_metadata.len() {
-            key_metadata[i].current_value = rows
-                .last()
-                .expect("No last row was retrieved")
-                .get(i)
-                .expect("No last row data at the index was found")
-                .clone();
+            if let postgres::SimpleQueryMessage::Row(row) =
+                rows.last().expect("No last row message found")
+            {
+                key_metadata[i].current_value = get_simple_data(row)
+                    .get(i)
+                    .expect("No last row data found")
+                    .clone();
+            }
         }
+
+        tx.send(rows)?;
     }
 
     Ok(())
 }
 
-fn get_simple_data(row: postgres::SimpleQueryRow) -> Vec<String> {
+fn process_pg_rows(
+    tx: Sender<ByteStream>,
+    rx: Receiver<Vec<postgres::SimpleQueryMessage>>,
+    delimiter: String,
+) -> Result<(), Box<dyn Error>> {
+    for received in rx {
+        tx.send(ByteStream::from(
+            received
+                .par_iter()
+                .filter_map(|message| match message {
+                    postgres::SimpleQueryMessage::Row(row) => {
+                        Some(get_simple_data(&row).join(&delimiter))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<String>>()
+                .join("\n")
+                .as_bytes()
+                .to_owned(),
+        ))?;
+    }
+    Ok(())
+}
+
+fn get_simple_data(row: &postgres::SimpleQueryRow) -> Vec<String> {
     row.columns()
         .iter()
         .map(|column| row.get(column.name()).expect("Null row data").to_string())
         .collect::<Vec<String>>()
 }
 
-// async fn send_to_s3(
-//     profile_name: String,
-//     aws_bucket: String,
-//     rx: Receiver<String>,
-// ) -> Result<(), Box<dyn Error>> {
-//     // Get s3 client
-//     let config: aws_config::SdkConfig = aws_config::from_env()
-//         .profile_name(profile_name)
-//         .load()
-//         .await;
-//     let s3_client: S3Client = aws_sdk_s3::Client::new(&config);
-//     let mut hasher: sha2::Sha256 = sha2::Sha256::new();
+async fn send_to_s3(args: Args, rx: Receiver<ByteStream>) -> Result<(), Box<dyn Error>> {
+    // Get s3 client
+    let config: aws_config::SdkConfig = aws_config::from_env()
+        .profile_name(&args.aws_profile)
+        .load()
+        .await;
+    let s3_client: S3Client = aws_sdk_s3::Client::new(&config);
+    let prefix: String = vec![
+        args.aws_prefix.clone().unwrap_or("".to_string()),
+        args.pg_database.clone(),
+        args.pg_schema.clone(),
+        args.pg_table.clone(),
+    ]
+    .join("/");
 
-//     // Extrapolate bucket from time as bucket/Y/M/D/H/hash
+    for received in rx {
+        let current_time = chrono::Utc::now();
+        let filename: String = vec![
+            prefix.clone(),
+            current_time.year().to_string(),
+            current_time.month().to_string(),
+            current_time.day().to_string(),
+            current_time.hour().to_string(),
+            uuid::Uuid::new_v4().as_hyphenated().to_string(),
+        ]
+        .into_iter()
+        .map(|value| value.to_uppercase())
+        .collect::<Vec<String>>()
+        .join("/");
 
-//     for received in rx {
-//         let current_time = chrono::Utc::now();
-//         let year = current_time.year();
-//         let month = current_time.month();
-//         let day = current_time.day();
-//         let hour = current_time.hour();
+        s3_client
+            .put_object()
+            .bucket(&args.aws_bucket)
+            .body(received)
+            .key(&filename)
+            .send()
+            .await
+            .unwrap();
+    }
+    Ok(())
+}
 
-//         let bucket = format!("{}/{}/{}/{}/{}", &aws_bucket, &year, &month, &day, &hour);
-//         hasher.update(current_time.to_string());
-//         let hash_bytes: Vec<u8> = hasher.finalize().into_iter().collect();
-//         let key =
-//             std::str::from_utf8(&hash_bytes).expect("Failed to convert hashed bytes to string.");
-//         put_object(&s3_client, &bucket, key, body).await?;
-//     }
-//     Ok(())
-// }
-
-fn main() {
-    // Validate and parse arguments
+#[tokio::main]
+async fn main() {
     let args: Args = Args::parse();
-    // let aws_profile: String = args.aws_profile.clone();
-    // let aws_bucket: String = args.aws_bucket.clone();
     if args.pg_keys.is_empty() {
         panic!("No key struct was sent. Please check your positional arguments.")
     }
 
-    let (tx, _): (Sender<String>, Receiver<String>) = mpsc::channel();
+    let (pg_tx, pg_rx): (
+        Sender<Vec<postgres::SimpleQueryMessage>>,
+        Receiver<Vec<postgres::SimpleQueryMessage>>,
+    ) = mpsc::channel();
+    let (processing_tx, processing_rx): (Sender<ByteStream>, Receiver<ByteStream>) =
+        mpsc::channel();
+    let delimiter: String = args.delimiter.clone();
 
-    get_pg_batch(args, tx).unwrap();
+    let get_rows_handle = std::thread::spawn(|| get_pg_batch(args, pg_tx).unwrap());
+
+    let process_rows_handle =
+        std::thread::spawn(|| process_pg_rows(processing_tx, pg_rx, delimiter).unwrap());
+
+    let put_object_handle = std::thread::spawn(|| async {
+        send_to_s3(Args::parse(), processing_rx).await.unwrap();
+    });
+
+    get_rows_handle.join().unwrap();
+    process_rows_handle.join().unwrap();
+    put_object_handle.join().unwrap().await;
 
     ()
 }
