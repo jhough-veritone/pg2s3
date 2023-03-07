@@ -309,28 +309,32 @@ async fn send_to_s3(args: Args, rx: Receiver<ByteStream>) -> Result<(), Box<dyn 
 
 #[tokio::main]
 async fn main() {
+    // Check and validate args
     let args: Args = Args::parse();
     if args.pg_keys.is_empty() {
         panic!("No key struct was sent. Please check your positional arguments.")
     }
+    let delimiter: String = args.delimiter.clone();
 
+    // Create threading channels
     let (pg_tx, pg_rx): (
         Sender<Vec<postgres::SimpleQueryMessage>>,
         Receiver<Vec<postgres::SimpleQueryMessage>>,
     ) = mpsc::channel();
     let (processing_tx, processing_rx): (Sender<ByteStream>, Receiver<ByteStream>) =
         mpsc::channel();
-    let delimiter: String = args.delimiter.clone();
 
+    // Start sync threads
     let get_rows_handle = std::thread::spawn(|| get_pg_batch(args, pg_tx).unwrap());
-
     let process_rows_handle =
         std::thread::spawn(|| process_pg_rows(processing_tx, pg_rx, delimiter).unwrap());
 
+    // Start async threads
     let put_object_handle = std::thread::spawn(|| async {
         send_to_s3(Args::parse(), processing_rx).await.unwrap();
     });
 
+    // Wait until all threads are finished
     get_rows_handle.join().unwrap();
     process_rows_handle.join().unwrap();
     put_object_handle.join().unwrap().await;
