@@ -15,13 +15,13 @@ use tokio;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Bounds {
-    max: i32,
-    min: i32,
+    max: i64,
+    min: i64,
 }
 
 impl Bounds {
-    fn get_iterations(&self, batch_size: &i32) -> i32 {
-        ((self.max - self.min).div(batch_size) as f32).floor() as i32
+    fn get_iterations(&self, batch_size: &i64) -> i64 {
+        ((self.max - self.min).div(batch_size) as f64).floor() as i64
     }
 }
 
@@ -46,7 +46,7 @@ struct Args {
     #[arg(short, long)]
     aws_prefix: Option<String>,
     #[arg(short, long, default_value_t = 0)]
-    start: i32,
+    start: i64,
     #[arg(short = 'm', long)]
     max: Option<u32>,
     #[arg(short = 'U', long, default_value_t = String::from("postgres"))]
@@ -58,9 +58,15 @@ struct Args {
     #[arg(short = 'd', long, default_value_t = String::from(","))]
     delimiter: String,
     #[arg(short, long, default_value_t = 150000)]
-    batch_size: i32,
+    batch_size: i64,
     #[arg(short, long, default_value_t = String::from("[NULL]"))]
     null: String,
+    #[arg(long, default_value_t = false)]
+    clean_dates: bool,
+    #[arg(long, default_value_t = false)]
+    arr_to_json: bool,
+    #[arg(long, default_value_t = false)]
+    clean_json: bool,
 }
 
 fn get_pg_batch(
@@ -90,7 +96,7 @@ fn get_pg_batch(
         .iter_mut()
         .map(|it|
             {
-                if it.data_type.to_uppercase().contains("TIMESTAMP") {
+                if it.data_type.to_uppercase().contains("TIMESTAMP") && args.clean_dates {
                     it.formatted_name = format!(
                         "CASE WHEN EXTRACT('YEAR' FROM {}) > 9999 THEN {} + (9999 - EXTRACT('YEAR' FROM {}) || ' years')::interval ELSE {} END AS {}",
                         it.name,
@@ -100,10 +106,10 @@ fn get_pg_batch(
                         it.name
                     );
                 }
-                else if it.data_type.to_uppercase().contains("ARRAY") {
+                else if it.data_type.to_uppercase().contains("ARRAY") && args.arr_to_json {
                     it.formatted_name = format!("TO_JSON({}) AS {}", it.name, it.name);
                 }
-                else if it.data_type.to_uppercase().contains("JSON") {
+                else if it.data_type.to_uppercase().contains("JSON") && args.clean_json {
                     it.formatted_name = format!("REGEXP_REPLACE({}::text, '\n|\r', 'g')::json AS {}", it.name, it.name); 
                 }
                 it
@@ -162,7 +168,7 @@ fn get_pg_batch(
         is_numeric
                 .then_some(
                     format!(
-                        "SELECT MIN({}) AS min, MAX({}) AS max FROM {}.{}",
+                        "SELECT MIN({})::int8 AS min, MAX({})::int8 AS max FROM {}.{}",
                         &key_metadata.get(0).expect("Empty key data").name,
                         &key_metadata.get(0).expect("Empty key data").name,
                         &args.pg_schema,
@@ -181,13 +187,15 @@ fn get_pg_batch(
 
     let bounds: Bounds = {
         let row = pg_client.query_one(&bounds_statement, &[])?;
+        let max: i64 = row.try_get::<&str, i64>("max")?;
+        let min: i64 = row.try_get::<&str, i64>("min")?;
         Bounds {
-            max: row.get("max"),
-            min: row.get("min"),
+            max: max,
+            min: min,
         }
     };
 
-    let iterations: i32 = bounds.get_iterations(&args.batch_size);
+    let iterations: i64 = bounds.get_iterations(&args.batch_size);
 
     for i in args.start..iterations {
         let predicate: String = is_numeric
