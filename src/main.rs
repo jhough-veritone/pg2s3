@@ -12,6 +12,19 @@ use std::ops::Div;
 use std::str;
 use std::sync::mpsc::{self, Receiver, Sender};
 use tokio;
+use tracing::{self, instrument};
+use tracing_subscriber;
+
+#[derive(Debug)]
+struct MetadataNotFound(String);
+
+impl Error for MetadataNotFound {}
+
+impl std::fmt::Display for MetadataNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Bounds {
@@ -21,7 +34,9 @@ struct Bounds {
 
 impl Bounds {
     fn get_iterations(&self, batch_size: &i64) -> i64 {
-        ((self.max - self.min).div(batch_size) as f64).floor() as i64
+        let raw: i64 = ((self.max - self.min).div(batch_size) as f64).floor() as i64;
+        let retval: i64 = if raw == 0 { 1 } else { raw };
+        return retval;
     }
 }
 
@@ -69,10 +84,12 @@ struct Args {
     clean_json: bool,
 }
 
+#[instrument]
 fn get_pg_batch(
     args: Args,
     tx: Sender<Vec<postgres::SimpleQueryMessage>>,
 ) -> Result<(), Box<dyn Error>> {
+    tracing::info!("Connecting to postgres instance");
     let mut pg_client: Client = Config::new()
         .user(&args.pg_user)
         .password(&args.pg_password)
@@ -83,6 +100,7 @@ fn get_pg_batch(
 
     // Get table metadata
     let metadata_statement = pg_client.prepare(format!("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{}' AND table_schema = '{}'", &args.pg_table, &args.pg_schema).as_str())?;
+    tracing::info!("Collecting table metadata");
     let column_metadata: Vec<ColumnData> = pg_client
         .query(&metadata_statement, &[])?
         .into_iter()
@@ -118,7 +136,9 @@ fn get_pg_batch(
         .collect();
 
     if column_metadata.is_empty() {
-        panic!("No metadata retrieved");
+        return Err(Box::new(MetadataNotFound(
+            "No metadata for the specified table.".into(),
+        )));
     }
 
     let mut key_metadata: Vec<ColumnData> = column_metadata
@@ -128,7 +148,9 @@ fn get_pg_batch(
         .collect::<Vec<ColumnData>>();
 
     if key_metadata.is_empty() {
-        panic!("No key metadata retreived");
+        return Err(Box::new(MetadataNotFound(
+            "No metadata for the specified key.".into(),
+        )));
     }
 
     let order_by: String = key_metadata
@@ -187,15 +209,19 @@ fn get_pg_batch(
 
     let bounds: Bounds = {
         let row = pg_client.query_one(&bounds_statement, &[])?;
-        let max: i64 = row.try_get::<&str, i64>("max")?;
-        let min: i64 = row.try_get::<&str, i64>("min")?;
         Bounds {
-            max: max,
-            min: min,
+            max: row.try_get::<&str, i64>("max")?,
+            min: row.try_get::<&str, i64>("min")?,
         }
     };
 
     let iterations: i64 = bounds.get_iterations(&args.batch_size);
+    tracing::info!(
+        iterations = iterations,
+        min = bounds.min,
+        max = bounds.max,
+        message = "Retreived iterations"
+    );
 
     for i in args.start..iterations {
         let predicate: String = is_numeric
@@ -222,38 +248,55 @@ fn get_pg_batch(
             &columns, &args.pg_schema, &args.pg_table, &predicate, &order_by, &args.batch_size
         );
 
+        tracing::info!(i = i, "Retreiving data from table");
         let rows: Vec<postgres::SimpleQueryMessage> =
             pg_client.simple_query(batch_statement.as_str())?;
+
+        if rows.len() == 0 {
+            tracing::info!(i = i, "No rows returned from query");
+            continue;
+        }
 
         for i in 0..key_metadata.len() {
             if let postgres::SimpleQueryMessage::Row(row) =
                 rows.last().expect("No last row message found")
             {
-                key_metadata[i].current_value = get_simple_data(row)
+                key_metadata[i].current_value = get_simple_data(row, args.null.clone())?
                     .get(i)
                     .expect("No last row data found")
                     .clone();
             }
         }
 
+        tracing::info!(
+            i = i,
+            rows_retreived = rows.len(),
+            "Sending data to processing thread"
+        );
         tx.send(rows)?;
     }
 
     Ok(())
 }
 
+#[instrument]
 fn process_pg_rows(
     tx: Sender<ByteStream>,
     rx: Receiver<Vec<postgres::SimpleQueryMessage>>,
     delimiter: String,
+    null: String,
 ) -> Result<(), Box<dyn Error>> {
     for received in rx {
-        tx.send(ByteStream::from(
+        tracing::info!(rows_received = received.len(), "Processing received rows");
+        let data: ByteStream = ByteStream::from(
             received
                 .par_iter()
                 .filter_map(|message| match message {
                     postgres::SimpleQueryMessage::Row(row) => {
-                        Some(get_simple_data(&row).join(&delimiter))
+                        let data = get_simple_data(&row, null.clone())
+                            .expect("Error occurred retreiving data")
+                            .join(&delimiter);
+                        Some(data)
                     }
                     _ => None,
                 })
@@ -261,18 +304,36 @@ fn process_pg_rows(
                 .join("\n")
                 .as_bytes()
                 .to_owned(),
-        ))?;
+        );
+        tracing::info!("Passing byte stream to S3 sender");
+        tx.send(data)?;
     }
     Ok(())
 }
 
-fn get_simple_data(row: &postgres::SimpleQueryRow) -> Vec<String> {
-    row.columns()
+fn get_simple_data(
+    row: &postgres::SimpleQueryRow,
+    null: String,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    tracing::debug!("Retreiving data from row");
+    Ok(row
+        .columns()
         .iter()
-        .map(|column| row.get(column.name()).expect("Null row data").to_string())
-        .collect::<Vec<String>>()
+        .map(|column| {
+            row.try_get(column.name())
+                .expect(
+                    format!(
+                        "Could not find column {} when processing data",
+                        column.name()
+                    )
+                    .as_str(),
+                )
+                .map_or_else(|| null.to_string(), |x| x.to_string())
+        })
+        .collect::<Vec<String>>())
 }
 
+#[instrument]
 async fn send_to_s3(args: Args, rx: Receiver<ByteStream>) -> Result<(), Box<dyn Error>> {
     // Get s3 client
     let config: aws_config::SdkConfig = aws_config::from_env()
@@ -303,6 +364,7 @@ async fn send_to_s3(args: Args, rx: Receiver<ByteStream>) -> Result<(), Box<dyn 
         .collect::<Vec<String>>()
         .join("/");
 
+        tracing::info!("Sending data to S3 bucket");
         s3_client
             .put_object()
             .bucket(&args.aws_bucket)
@@ -315,14 +377,26 @@ async fn send_to_s3(args: Args, rx: Receiver<ByteStream>) -> Result<(), Box<dyn 
     Ok(())
 }
 
+#[instrument]
 #[tokio::main]
 async fn main() {
+    // Set logging
+    let subscriber = tracing_subscriber::fmt()
+        .pretty()
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_target(false)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+
     // Check and validate args
     let args: Args = Args::parse();
     if args.pg_keys.is_empty() {
         panic!("No key struct was sent. Please check your positional arguments.")
     }
     let delimiter: String = args.delimiter.clone();
+    let null: String = args.null.clone();
 
     // Create threading channels
     let (pg_tx, pg_rx): (
@@ -333,19 +407,44 @@ async fn main() {
         mpsc::channel();
 
     // Start sync threads
-    let get_rows_handle = std::thread::spawn(|| get_pg_batch(args, pg_tx).unwrap());
-    let process_rows_handle =
-        std::thread::spawn(|| process_pg_rows(processing_tx, pg_rx, delimiter).unwrap());
+    let get_rows_handle = std::thread::spawn(|| {
+        if let Err(e) = get_pg_batch(args, pg_tx) {
+            tracing::error!("An error occurred getting data from the table: {}", e);
+            panic!("{}", e)
+        }
+    });
+    let process_rows_handle = std::thread::spawn(|| {
+        if let Err(e) = process_pg_rows(processing_tx, pg_rx, delimiter, null) {
+            tracing::error!("An error occurred processing data: {}", e);
+            panic!("{}", e);
+        }
+    });
 
     // Start async threads
     let put_object_handle = std::thread::spawn(|| async {
-        send_to_s3(Args::parse(), processing_rx).await.unwrap();
+        if let Err(e) = send_to_s3(Args::parse(), processing_rx).await {
+            tracing::error!("An error occurred sending data to S3: {}", e);
+            panic!("{}", e);
+        }
     });
 
     // Wait until all threads are finished
-    get_rows_handle.join().unwrap();
-    process_rows_handle.join().unwrap();
-    put_object_handle.join().unwrap().await;
+    if let Err(e) = get_rows_handle.join() {
+        tracing::error!("An error occurred getting data from table: {:#?}", e);
+        panic!("{:#?}", e);
+    };
+    if let Err(e) = process_rows_handle.join() {
+        tracing::error!("An error occured processing data {:#?}", e);
+        panic!("{:#?}", e);
+    };
+    match put_object_handle.join() {
+        Ok(f) => f.await,
+        Err(e) => {
+            tracing::error!("An error occurred putting data in S3: {:#?}", e);
+            panic!("{:#?}", e)
+        }
+    };
 
+    tracing::info!("Finished sending all data available to S3");
     ()
 }
