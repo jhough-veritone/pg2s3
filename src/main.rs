@@ -4,6 +4,7 @@ use aws_sdk_s3::{self, types::ByteStream};
 use clap::Parser;
 use std::str;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{spawn, JoinHandle};
 use tokio;
 use tracing::{self, instrument};
 use tracing_subscriber;
@@ -78,43 +79,44 @@ async fn main() {
         mpsc::channel();
 
     // Start sync threads
-    let get_rows_handle = std::thread::spawn(|| {
-        if let Err(e) = get_pg_batch(args, pg_tx) {
-            tracing::error!("An error occurred getting data from the table: {}", e);
-            panic!("{}", e)
-        }
-    });
-    let process_rows_handle = std::thread::spawn(|| {
-        if let Err(e) = process_pg_rows(processing_tx, pg_rx, delimiter, null) {
-            tracing::error!("An error occurred processing data: {}", e);
-            panic!("{}", e);
-        }
-    });
+    let sync_handlers: [JoinHandle<()>; 2] = [
+        spawn(|| {
+            get_pg_batch(args, pg_tx)
+                .map_err(|e| tracing::error!(error = e, "An error occurred retreiving data"))
+                .unwrap()
+        }),
+        spawn(|| {
+            process_pg_rows(processing_tx, pg_rx, delimiter, null)
+                .map_err(|e| tracing::error!(error = e, "An error occurred processing rows"))
+                .unwrap()
+        })
+    ];
 
     // Start async threads
-    let put_object_handle = std::thread::spawn(|| async {
-        if let Err(e) = send_to_s3(Args::parse(), processing_rx).await {
-            tracing::error!("An error occurred sending data to S3: {}", e);
-            panic!("{}", e);
-        }
-    });
+    let async_handlers = [
+    spawn(|| async {
+            send_to_s3(Args::parse(), processing_rx)
+                .await
+                .map_err(|e| tracing::error!(error = e, "An error occurred send data to S3"))
+                .unwrap()
+        })
+    ];
 
     // Wait until all threads are finished
-    if let Err(e) = get_rows_handle.join() {
-        tracing::error!("An error occurred getting data from table: {:#?}", e);
-        panic!("{:#?}", e);
-    };
-    if let Err(e) = process_rows_handle.join() {
-        tracing::error!("An error occured processing data {:#?}", e);
-        panic!("{:#?}", e);
-    };
-    match put_object_handle.join() {
-        Ok(f) => f.await,
-        Err(e) => {
-            tracing::error!("An error occurred putting data in S3: {:#?}", e);
-            panic!("{:#?}", e)
-        }
-    };
+    for handler in sync_handlers {
+        handler
+        .join()
+        .map_err(|e| tracing::error!(error = ?e, "An error occurred joining a sync handler"))
+        .unwrap()
+    }
+
+    for handler in async_handlers {
+        handler
+        .join()
+        .map_err(|e| {tracing::error!(error = ?e, "An error occurred joining an async handler")})
+        .unwrap()
+        .await
+    }
 
     tracing::info!("Finished sending all data available to S3");
     ()
