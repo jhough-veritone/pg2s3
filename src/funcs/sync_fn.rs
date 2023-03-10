@@ -4,10 +4,9 @@ use crate::structs::{bounds::Bounds, column_data::ColumnData};
 use rayon::prelude::*;
 use crate::mpsc::{Receiver, Sender};
 use postgres::{Client, Config, NoTls};
-use crate::mpsc::{Receiver, Sender};
 use crate::Args;
 use std::error::Error;
-use tracing::{self, instrument};
+use aws_sdk_s3::{self, types::ByteStream};
 
 #[instrument]
 pub fn get_pg_batch(
