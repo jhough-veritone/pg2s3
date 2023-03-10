@@ -1,10 +1,10 @@
+use crate::mpsc::Receiver;
+use crate::Args;
 use aws_config;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::{self, types::ByteStream};
 use chrono::Datelike;
 use chrono::Timelike;
-use crate::mpsc::{Receiver};
-use crate::Args;
 use std::error::Error;
 use tracing::{self, instrument};
 

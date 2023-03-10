@@ -1,12 +1,12 @@
-use tracing::{self, instrument};
 use crate::errors::metadata_not_found::MetadataNotFound;
-use crate::structs::{bounds::Bounds, column_data::ColumnData};
-use rayon::prelude::*;
 use crate::mpsc::{Receiver, Sender};
-use postgres::{Client, Config, NoTls};
+use crate::structs::{bounds::Bounds, column_data::ColumnData};
 use crate::Args;
-use std::error::Error;
 use aws_sdk_s3::{self, types::ByteStream};
+use postgres::{Client, Config, NoTls};
+use rayon::prelude::*;
+use std::error::Error;
+use tracing::{self, instrument};
 
 #[instrument]
 pub fn get_pg_batch(
@@ -160,9 +160,7 @@ pub fn get_pg_batch(
                 Some(
                     key_metadata
                         .iter()
-                        .map(|it| {
-                            format!("'{}'::text >= '{}'::text", it.name, it.current_value)
-                        })
+                        .map(|it| format!("'{}'::text >= '{}'::text", it.name, it.current_value))
                         .collect::<Vec<String>>()
                         .join(" AND "),
                 )

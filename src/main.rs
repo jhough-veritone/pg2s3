@@ -1,3 +1,5 @@
+use crate::funcs::async_fn::send_to_s3;
+use crate::funcs::sync_fn::{get_pg_batch, process_pg_rows};
 use aws_sdk_s3::{self, types::ByteStream};
 use clap::Parser;
 use std::str;
@@ -5,12 +7,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use tokio;
 use tracing::{self, instrument};
 use tracing_subscriber;
-use crate::funcs::async_fn::send_to_s3;
-use crate::funcs::sync_fn::{get_pg_batch, process_pg_rows};
 
 mod errors;
-mod structs;
 mod funcs;
+mod structs;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
