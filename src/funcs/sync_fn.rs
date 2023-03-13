@@ -9,7 +9,16 @@ use tracing::{self, instrument};
 
 #[instrument]
 pub fn get_pg_batch(
-    pg_args: (String, u16, String, String, String, Vec<String>, String, String),
+    pg_args: (
+        String,
+        u16,
+        String,
+        String,
+        String,
+        Vec<String>,
+        String,
+        String,
+    ),
     formatting_rules_args: (bool, bool, bool),
     iter_args: (i64, i64, i64),
     output_args: (String, String),

@@ -10,7 +10,16 @@ use tracing::{self, instrument};
 #[instrument]
 pub async fn send_to_s3(
     aws_args: (String, String, String),
-    pg_args: (String, u16, String, String, String, Vec<String>, String, String),
+    pg_args: (
+        String,
+        u16,
+        String,
+        String,
+        String,
+        Vec<String>,
+        String,
+        String,
+    ),
     rx: Receiver<ByteStream>,
 ) -> Result<(), Box<dyn Error>> {
     let (aws_profile, aws_bucket, aws_prefix) = aws_args;

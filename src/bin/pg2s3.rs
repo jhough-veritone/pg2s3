@@ -46,7 +46,18 @@ pub struct Args {
 }
 
 impl Args {
-    pub fn get_pg_args(&self) -> (String, u16, String, String, String, Vec<String>, String, String) {
+    pub fn get_pg_args(
+        &self,
+    ) -> (
+        String,
+        u16,
+        String,
+        String,
+        String,
+        Vec<String>,
+        String,
+        String,
+    ) {
         (
             self.pg_host.clone(),
             self.pg_port,
@@ -55,7 +66,7 @@ impl Args {
             self.pg_table.clone(),
             self.pg_keys.clone(),
             self.pg_user.clone(),
-            self.pg_password.clone()
+            self.pg_password.clone(),
         )
     }
 
@@ -67,7 +78,10 @@ impl Args {
         (
             self.aws_profile.clone(),
             self.aws_bucket.clone(),
-            self.aws_prefix.as_ref().map_or("".to_string(), |v| v.to_string()).clone()
+            self.aws_prefix
+                .as_ref()
+                .map_or("".to_string(), |v| v.to_string())
+                .clone(),
         )
     }
 
@@ -124,21 +138,30 @@ async fn main() {
                 output_args,
                 pg_tx,
             )
-            .map_err(|e| tracing::error!(error = e, "An error occurred retreiving data"))
-            .unwrap()
+            .map_err(|e| {
+                tracing::error!(error = e, "An error occurred retreiving data");
+                panic!("{}", e)
+            })
+            .unwrap();
         }),
         spawn(move || {
             process_pg_rows(output_args_2, processing_tx, pg_rx)
-                .map_err(|e| tracing::error!(error = e, "An error occurred processing rows"))
-                .unwrap()
+                .map_err(|e| {
+                    tracing::error!(error = e, "An error occurred processing rows");
+                    panic!("{}", e)
+                })
+                .unwrap();
         }),
     ];
 
     // Start async threads
     let async_handlers = [spawn(move || async move {
-        send_to_s3(aws_args, pg_args_2,processing_rx)
+        send_to_s3(aws_args, pg_args_2, processing_rx)
             .await
-            .map_err(|e| tracing::error!(error = e, "An error occurred send data to S3"))
+            .map_err(|e| {
+                tracing::error!(error = e, "An error occurred send data to S3");
+                panic!("{}", e)
+            })
             .unwrap()
     })];
 
@@ -147,14 +170,14 @@ async fn main() {
         handler
             .join()
             .map_err(|e| tracing::error!(error = ?e, "An error occurred joining a sync handler"))
-            .unwrap()
+            .expect("An error occurred in a sync process")
     }
 
     for handler in async_handlers {
         handler
             .join()
             .map_err(|e| tracing::error!(error = ?e, "An error occurred joining an async handler"))
-            .unwrap()
+            .expect("An error occurred in an async process")
             .await
     }
 
