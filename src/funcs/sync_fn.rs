@@ -1,29 +1,36 @@
 use crate::errors::metadata_not_found::MetadataNotFound;
-use crate::mpsc::{Receiver, Sender};
 use crate::structs::{bounds::Bounds, column_data::ColumnData};
-use crate::Args;
 use aws_sdk_s3::{self, types::ByteStream};
 use postgres::{Client, Config, NoTls};
 use rayon::prelude::*;
 use std::error::Error;
+use std::sync::mpsc::{Receiver, Sender};
 use tracing::{self, instrument};
 
 #[instrument]
 pub fn get_pg_batch(
-    args: Args,
+    pg_args: (String, u16, String, String, String, Vec<String>, String, String),
+    formatting_rules_args: (bool, bool, bool),
+    iter_args: (i64, i64, i64),
+    output_args: (String, String),
     tx: Sender<Vec<postgres::SimpleQueryMessage>>,
 ) -> Result<(), Box<dyn Error>> {
+    let (pg_host, pg_port, pg_database, pg_schema, pg_table, pg_keys, pg_user, pg_password) =
+        pg_args;
+    let (clean_dates, arr_to_json, clean_json) = formatting_rules_args;
+    let (batch_size, start, _) = iter_args;
+    let (null, _) = output_args;
     tracing::info!("Connecting to postgres instance");
     let mut pg_client: Client = Config::new()
-        .user(&args.pg_user)
-        .password(&args.pg_password)
-        .dbname(&args.pg_database)
-        .host(&args.pg_host)
-        .port(args.pg_port)
+        .user(&pg_user)
+        .password(&pg_password)
+        .dbname(&pg_database)
+        .host(&pg_host)
+        .port(pg_port)
         .connect(NoTls)?;
 
     // Get table metadata
-    let metadata_statement = pg_client.prepare(format!("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{}' AND table_schema = '{}'", &args.pg_table, &args.pg_schema).as_str())?;
+    let metadata_statement = pg_client.prepare(format!("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{}' AND table_schema = '{}'", pg_table, pg_schema).as_str())?;
     tracing::info!("Collecting table metadata");
     let column_metadata: Vec<ColumnData> = pg_client
         .query(&metadata_statement, &[])?
@@ -38,7 +45,7 @@ pub fn get_pg_batch(
         .iter_mut()
         .map(|it|
             {
-                if it.data_type.to_uppercase().contains("TIMESTAMP") && args.clean_dates {
+                if it.data_type.to_uppercase().contains("TIMESTAMP") && clean_dates {
                     it.formatted_name = format!(
                         "CASE WHEN EXTRACT('YEAR' FROM {}) > 9999 THEN {} + (9999 - EXTRACT('YEAR' FROM {}) || ' years')::interval ELSE {} END AS {}",
                         it.name,
@@ -48,10 +55,10 @@ pub fn get_pg_batch(
                         it.name
                     );
                 }
-                else if it.data_type.to_uppercase().contains("ARRAY") && args.arr_to_json {
+                else if it.data_type.to_uppercase().contains("ARRAY") && arr_to_json {
                     it.formatted_name = format!("TO_JSON({}) AS {}", it.name, it.name);
                 }
-                else if it.data_type.to_uppercase().contains("JSON") && args.clean_json {
+                else if it.data_type.to_uppercase().contains("JSON") && clean_json {
                     it.formatted_name = format!("REGEXP_REPLACE({}::text, '\n|\r', 'g')::json AS {}", it.name, it.name); 
                 }
                 it
@@ -68,7 +75,7 @@ pub fn get_pg_batch(
     let mut key_metadata: Vec<ColumnData> = column_metadata
         .clone()
         .into_iter()
-        .filter(|row| args.pg_keys.contains(&row.name))
+        .filter(|row| pg_keys.contains(&row.name))
         .collect::<Vec<ColumnData>>();
 
     if key_metadata.is_empty() {
@@ -117,14 +124,14 @@ pub fn get_pg_batch(
                         "SELECT MIN({})::int8 AS min, MAX({})::int8 AS max FROM {}.{}",
                         &key_metadata.get(0).expect("Empty key data").name,
                         &key_metadata.get(0).expect("Empty key data").name,
-                        &args.pg_schema,
-                        &args.pg_table
+                        pg_schema,
+                        pg_table
                     )
                 ).or_else(|| Some(
                     format!(
                         "SELECT c.reltuples::bigint AS max, 0 AS min FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = {} AND n.nspname = {}",
-                        &args.pg_table,
-                        &args.pg_schema
+                        pg_table,
+                        pg_schema
                     )
                 ))
                 .unwrap()
@@ -139,7 +146,7 @@ pub fn get_pg_batch(
         }
     };
 
-    let iterations: i64 = bounds.get_iterations(&args.batch_size);
+    let iterations: i64 = bounds.get_iterations(&batch_size);
     tracing::info!(
         iterations = iterations,
         min = bounds.min,
@@ -147,14 +154,14 @@ pub fn get_pg_batch(
         message = "Retreived iterations"
     );
 
-    for i in args.start..iterations {
+    for i in start..iterations {
         let predicate: String = is_numeric
             .then_some(format!(
                 "{} >= {} AND {} < {}",
                 key_metadata.get(0).expect("No key found").name,
-                i * &args.batch_size + &bounds.min,
+                i * &batch_size + &bounds.min,
                 key_metadata.get(0).expect("No key found").name,
-                (i + 1) * &args.batch_size + &bounds.min,
+                (i + 1) * &batch_size + &bounds.min,
             ))
             .or_else(|| {
                 Some(
@@ -169,7 +176,7 @@ pub fn get_pg_batch(
 
         let batch_statement: String = format!(
             "SELECT {} FROM {}.{} WHERE {} ORDER BY {} LIMIT {}",
-            &columns, &args.pg_schema, &args.pg_table, &predicate, &order_by, &args.batch_size
+            &columns, pg_schema, pg_table, &predicate, &order_by, &batch_size
         );
 
         tracing::info!(i = i, "Retreiving data from table");
@@ -185,7 +192,7 @@ pub fn get_pg_batch(
             if let postgres::SimpleQueryMessage::Row(row) =
                 rows.last().expect("No last row message found")
             {
-                key_metadata[i].current_value = get_simple_data(row, args.null.clone())?
+                key_metadata[i].current_value = get_simple_data(row, &null)?
                     .get(i)
                     .expect("No last row data found")
                     .clone();
@@ -205,7 +212,7 @@ pub fn get_pg_batch(
 
 fn get_simple_data(
     row: &postgres::SimpleQueryRow,
-    null: String,
+    null: &str,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     tracing::debug!("Retreiving data from row");
     Ok(row
@@ -227,11 +234,11 @@ fn get_simple_data(
 
 #[instrument]
 pub fn process_pg_rows(
+    output_args: (String, String),
     tx: Sender<ByteStream>,
     rx: Receiver<Vec<postgres::SimpleQueryMessage>>,
-    delimiter: String,
-    null: String,
 ) -> Result<(), Box<dyn Error>> {
+    let (null, delimiter) = output_args;
     for received in rx {
         tracing::info!(rows_received = received.len(), "Processing received rows");
         let data: ByteStream = ByteStream::from(
@@ -239,7 +246,7 @@ pub fn process_pg_rows(
                 .par_iter()
                 .filter_map(|message| match message {
                     postgres::SimpleQueryMessage::Row(row) => {
-                        let data = get_simple_data(&row, null.clone())
+                        let data = get_simple_data(&row, &null)
                             .expect("Error occurred retreiving data")
                             .join(&delimiter);
                         Some(data)
