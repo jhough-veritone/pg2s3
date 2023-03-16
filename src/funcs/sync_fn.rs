@@ -247,7 +247,7 @@ pub fn process_pg_rows(
     tx: Sender<ByteStream>,
     rx: Receiver<Vec<postgres::SimpleQueryMessage>>,
 ) -> Result<(), Box<dyn Error>> {
-    let (null, delimiter) = output_args;
+    let (delimiter, null) = output_args;
     for received in rx {
         tracing::info!(rows_received = received.len(), "Processing received rows");
         let data: ByteStream = ByteStream::from(
